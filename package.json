@@ -1,0 +1,23 @@
+{
+  "name": "project-1773993368271-j8eh9dzsy",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node scripts/run-dev.js",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "^15.5.14",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "eslint": "^9.17.0",
+    "eslint-config-next": "15.1.0",
+    "typescript": "^5.7.2"
+  }
+}
