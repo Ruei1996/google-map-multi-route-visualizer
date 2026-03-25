@@ -1,6 +1,6 @@
 'use client';
 
-import { Plus, Trash2, MapPin, GripVertical } from 'lucide-react';
+import { Plus, Trash2, MapPin } from 'lucide-react';
 import type { Location } from '@/types/maps';
 
 interface Props {

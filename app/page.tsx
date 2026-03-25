@@ -1,15 +1,32 @@
 'use client';
 
+/**
+ * MapsPage — Root page for the Google Maps Multi-Route Visualizer.
+ *
+ * Layout (desktop):  Left panel (controls + results)  |  Right panel (map)
+ * Layout (mobile):   Stacked column — controls → map → results
+ *
+ * State management:
+ *  • origin / destinations  — form inputs
+ *  • travelOptions          — travel mode + avoid / transit settings
+ *  • routes / originCoords  — API results
+ *  • loading / error / modal — UI feedback
+ */
+
 import { useState, useCallback, useRef } from 'react';
 import { Calculator, RotateCcw, AlertCircle, MapPin, Layers } from 'lucide-react';
 
-import AppHeader from '@/components/maps/AppHeader';
+import AppHeader      from '@/components/maps/AppHeader';
 import QuotaDashboard from '@/components/maps/QuotaDashboard';
-import OriginInput from '@/components/maps/OriginInput';
-import LocationTable from '@/components/maps/LocationTable';
-import MapView from '@/components/maps/MapView';
-import ResultsTable from '@/components/maps/ResultsTable';
-import WarningModal from '@/components/maps/WarningModal';
+import OriginInput    from '@/components/maps/OriginInput';
+import LocationTable  from '@/components/maps/LocationTable';
+import MapView        from '@/components/maps/MapView';
+import ResultsTable   from '@/components/maps/ResultsTable';
+import WarningModal   from '@/components/maps/WarningModal';
+import TravelOptions, {
+  type TravelOptionsState,
+  DEFAULT_TRAVEL_OPTIONS,
+} from '@/components/maps/TravelOptions';
 
 import type {
   Location,
@@ -18,42 +35,50 @@ import type {
   CalculateResponse,
 } from '@/types/maps';
 
-// ─────────────────────────────────────────────────────────
-//  Default demo data so the user can try it right away
-// ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  Default demo data — lets users try the app immediately
+// ─────────────────────────────────────────────────────────────
 const DEMO_ORIGIN = '302新竹縣竹北市福興路757號';
 const DEMO_DESTINATIONS: Location[] = [
   { id: 'demo-1', address: '台北市信義區市府路1號' },
   { id: 'demo-2', address: '新竹市東區中正路120號' },
 ];
 
+// ── Modal state union ─────────────────────────────────────────
 type ModalState =
   | { open: false }
   | { open: true; type: 'warning' | 'exhausted'; quota: QuotaStatus };
 
+// ── Page component ────────────────────────────────────────────
 export default function MapsPage() {
-  // ── form state ──
-  const [origin, setOrigin] = useState(DEMO_ORIGIN);
+
+  // ── Form state ──────────────────────────────────────────────
+  const [origin, setOrigin]             = useState(DEMO_ORIGIN);
   const [destinations, setDestinations] = useState<Location[]>(DEMO_DESTINATIONS);
 
-  // ── result state ──
-  const [routes, setRoutes] = useState<RouteResult[]>([]);
-  const [originCoords, setOriginCoords] = useState<{ lat: number; lng: number } | undefined>();
+  // ── Travel / routing options ────────────────────────────────
+  const [travelOptions, setTravelOptions] = useState<TravelOptionsState>(
+    DEFAULT_TRAVEL_OPTIONS,
+  );
 
-  // ── UI state ──
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [modal, setModal] = useState<ModalState>({ open: false });
-  const warningShownRef = useRef(false);
-  const exhaustedShownRef = useRef(false);
+  // ── Result state ────────────────────────────────────────────
+  const [routes, setRoutes]           = useState<RouteResult[]>([]);
+  const [originCoords, setOriginCoords] = useState<
+    { lat: number; lng: number } | undefined
+  >();
 
-  // ── quota colour map for the location table badges ──
+  // ── UI state ─────────────────────────────────────────────────
+  const [loading, setLoading]     = useState(false);
+  const [error, setError]         = useState<string | null>(null);
+  const [modal, setModal]         = useState<ModalState>({ open: false });
+  const warningShownRef           = useRef(false);
+  const exhaustedShownRef         = useRef(false);
+
+  // ── Route colour map for location-table badge colouring ─────
   const routeColorMap: Record<string, string> = {};
-  routes.forEach((r) => {
-    routeColorMap[r.locationId] = r.color;
-  });
+  routes.forEach((r) => { routeColorMap[r.locationId] = r.color; });
 
-  /* ── Quota update callback from QuotaDashboard ── */
+  /* ── Quota update callback — triggers warning / exhausted modal ── */
   const handleQuotaUpdate = useCallback((status: QuotaStatus) => {
     if (status.isExhausted && !exhaustedShownRef.current) {
       exhaustedShownRef.current = true;
@@ -67,8 +92,9 @@ export default function MapsPage() {
   /* ── Calculate routes ── */
   const handleCalculate = async () => {
     const trimmedOrigin = origin.trim();
-    const filledDests = destinations.filter((d) => d.address.trim() !== '');
+    const filledDests   = destinations.filter((d) => d.address.trim() !== '');
 
+    // Client-side validation
     if (!trimmedOrigin) {
       setError('請輸入出發基準點。');
       return;
@@ -83,20 +109,27 @@ export default function MapsPage() {
 
     try {
       const res = await fetch('/api/maps/calculate', {
-        method: 'POST',
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ origin: trimmedOrigin, destinations: filledDests }),
+        body:    JSON.stringify({
+          origin:            trimmedOrigin,
+          destinations:      filledDests,
+          // ── Routing options ──
+          travelMode:         travelOptions.travelMode,
+          avoidOptions:       travelOptions.avoidOptions,
+          transitModes:       travelOptions.transitModes,
+          // Only send transitPreference when non-empty
+          transitPreference:  travelOptions.transitPreference || undefined,
+        }),
       });
 
       const data: CalculateResponse & { error?: string; message?: string } =
         await res.json();
 
+      // ── 429: quota exhausted kill-switch ──
       if (res.status === 429) {
-        // Kill switch triggered
         setError(data.message ?? '額度已耗盡，所有請求已被攔截。');
-        if (data.quotaStatus) {
-          handleQuotaUpdate(data.quotaStatus);
-        }
+        if (data.quotaStatus) handleQuotaUpdate(data.quotaStatus);
         return;
       }
 
@@ -108,43 +141,43 @@ export default function MapsPage() {
       setRoutes(data.routes ?? []);
       setOriginCoords(data.originCoords);
 
-      // Trigger quota modals if needed
-      if (data.quotaStatus) {
-        handleQuotaUpdate(data.quotaStatus);
-      }
+      // Show quota warning / exhausted modal if threshold crossed
+      if (data.quotaStatus) handleQuotaUpdate(data.quotaStatus);
 
-      // Smooth-scroll to map on mobile
+      // Smooth-scroll to map on mobile after a short render delay
       if (window.innerWidth < 1024) {
         setTimeout(() => {
           document.getElementById('map-section')?.scrollIntoView({
             behavior: 'smooth',
-            block: 'start',
+            block:    'start',
           });
         }, 200);
       }
-    } catch (err) {
+    } catch {
       setError('網路錯誤，無法連線至伺服器。請確認您的網路連線後再試。');
     } finally {
       setLoading(false);
     }
   };
 
-  /* ── Reset all ── */
+  /* ── Reset all state back to defaults ── */
   const handleReset = () => {
     setOrigin('');
     setDestinations([]);
     setRoutes([]);
     setOriginCoords(undefined);
     setError(null);
-    warningShownRef.current = false;
+    setTravelOptions(DEFAULT_TRAVEL_OPTIONS);
+    warningShownRef.current   = false;
     exhaustedShownRef.current = false;
   };
 
-  const hasResults = routes.length > 0;
-  const validDestCount = destinations.filter((d) => d.address.trim()).length;
+  const hasResults      = routes.length > 0;
+  const validDestCount  = destinations.filter((d) => d.address.trim()).length;
 
   return (
     <div className="flex flex-col min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+
       {/* ── Header ── */}
       <AppHeader />
 
@@ -156,10 +189,11 @@ export default function MapsPage() {
       {/* ── Main content ── */}
       <main className="flex-1 max-w-screen-2xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-4">
         <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
-          {/* ══════════════════════════
-               LEFT PANEL — Controls
-             ══════════════════════════ */}
-          <aside className="w-full lg:w-[420px] xl:w-[460px] shrink-0 flex flex-col gap-4">
+
+          {/* ══════════════════════════════════════
+               LEFT PANEL — Controls + Results
+             ══════════════════════════════════════ */}
+          <aside className="w-full lg:w-[440px] xl:w-[480px] shrink-0 flex flex-col gap-4">
 
             {/* ── Card: Origin + Destinations ── */}
             <div className="
@@ -176,6 +210,19 @@ export default function MapsPage() {
                 onChange={setDestinations}
                 disabled={loading}
                 routeColors={routeColorMap}
+              />
+            </div>
+
+            {/* ── Card: Travel Options ── */}
+            <div className="
+              rounded-2xl border border-slate-200 dark:border-slate-700
+              bg-white dark:bg-slate-900 shadow-sm
+              p-5
+            ">
+              <TravelOptions
+                options={travelOptions}
+                onChange={setTravelOptions}
+                disabled={loading}
               />
             </div>
 
@@ -224,6 +271,7 @@ export default function MapsPage() {
                 )}
               </button>
 
+              {/* Reset button */}
               <button
                 onClick={handleReset}
                 disabled={loading}
@@ -243,7 +291,7 @@ export default function MapsPage() {
               </button>
             </div>
 
-            {/* ── Results table (desktop: in left panel) ── */}
+            {/* ── Results table (shown in left panel after calculation) ── */}
             {hasResults && (
               <div className="
                 rounded-2xl border border-slate-200 dark:border-slate-700
@@ -253,7 +301,7 @@ export default function MapsPage() {
               </div>
             )}
 
-            {/* ── Empty state hint ── */}
+            {/* ── Empty-state hint when no results yet ── */}
             {!hasResults && !loading && (
               <div className="
                 rounded-2xl border-2 border-dashed border-slate-200 dark:border-slate-800
@@ -266,9 +314,9 @@ export default function MapsPage() {
             )}
           </aside>
 
-          {/* ══════════════════════════
+          {/* ══════════════════════════════════════
                RIGHT PANEL — Map
-             ══════════════════════════ */}
+             ══════════════════════════════════════ */}
           <section
             id="map-section"
             className="
@@ -280,7 +328,7 @@ export default function MapsPage() {
               lg:h-[calc(100vh-6rem)]
             "
           >
-            {/* Map header bar */}
+            {/* Map header bar — shows colour legend + route count */}
             <div className="
               flex items-center justify-between
               px-4 py-3
@@ -291,6 +339,7 @@ export default function MapsPage() {
                 <MapPin className="w-4 h-4 text-blue-500" />
                 路線地圖
               </div>
+
               {hasResults && (
                 <div className="flex items-center gap-1.5 flex-wrap">
                   {routes
@@ -299,9 +348,10 @@ export default function MapsPage() {
                       <div
                         key={r.locationId}
                         className="flex items-center gap-1 text-xs"
+                        title={r.address}
                       >
                         <div
-                          className="w-3 h-3 rounded-full"
+                          className="w-3 h-3 rounded-full shrink-0"
                           style={{ backgroundColor: r.color }}
                         />
                         <span className="text-slate-500 dark:text-slate-400 hidden sm:inline">
@@ -322,6 +372,7 @@ export default function MapsPage() {
               />
             </div>
           </section>
+
         </div>
       </main>
 
@@ -344,7 +395,7 @@ export default function MapsPage() {
         提供 · 路線資料由 Google Maps Directions API 提供
       </footer>
 
-      {/* ── Warning / Exhausted modal ── */}
+      {/* ── Quota warning / exhausted modal ── */}
       {modal.open && (
         <WarningModal
           type={modal.type}
