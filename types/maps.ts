@@ -90,6 +90,41 @@ export interface QuotaStatus {
   lastReset: string;    // ISO date string
 }
 
+/**
+ * Per-API-type quota snapshot.
+ * Tracks usage separately for each Google Maps API type
+ * (Directions API, Geocoding API, etc.)
+ */
+export interface ApiTypeQuota {
+  apiType: string;
+  displayName: string;
+  used: number;
+  limit: number;
+  remaining: number;
+  percentage: number;      // 0–100
+  isExhausted: boolean;
+  isWarning: boolean;      // remaining ≤ 10 % of limit
+  costPer1000: number;     // USD per 1,000 requests
+  freeCreditUsd: number;   // monthly free credit in USD
+}
+
+/**
+ * Aggregated quota status including per-type breakdown.
+ * Returned by GET /api/maps/quota and included in calculate responses.
+ */
+export interface QuotaStatusByType {
+  /** Per-API-type breakdown (Directions API, Geocoding API, etc.) */
+  byType: ApiTypeQuota[];
+  /** Legacy combined quota for backward compatibility with existing callers */
+  combined: QuotaStatus;
+  /** True when ANY single API type is exhausted */
+  isAnyExhausted: boolean;
+  /** True when ANY single API type is at warning level (≤ 10% remaining) */
+  isAnyWarning: boolean;
+  /** Indicates which storage backend provided this data */
+  storageBackend: 'supabase' | 'memory';
+}
+
 // ── Request / Response ─────────────────────────────────────
 /** POST /api/maps/calculate — request body */
 export interface CalculateRequest {
@@ -121,6 +156,9 @@ export interface CalculateRequest {
 /** POST /api/maps/calculate — response body */
 export interface CalculateResponse {
   routes: RouteResult[];
+  /** Legacy combined quota status (always present for backward compatibility) */
   quotaStatus: QuotaStatus;
+  /** Full per-API-type quota breakdown (present when Supabase is enabled or always from quota-service) */
+  quotaStatusByType?: QuotaStatusByType;
   originCoords?: { lat: number; lng: number };
 }

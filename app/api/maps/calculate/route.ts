@@ -7,6 +7,8 @@
  *  • GOOGLE_MAPS_API_KEY is NEVER exposed to the client — only read here.
  *  • Kill Switch: if the global quota counter is exhausted, the endpoint
  *    immediately returns HTTP 429 and performs ZERO Google API calls.
+ *  • All user inputs are validated before being passed to the Google APIs.
+ *  • Supabase parameterized queries prevent SQL injection.
  *
  * Supported options (passed via request body):
  *  • travelMode        — driving | motorcycle | transit | walking | bicycling
@@ -15,14 +17,19 @@
  *  • transitPreference — less_walking | fewer_transfers (transit only)
  *  • trafficModel      — best_guess | pessimistic | optimistic (driving only)
  *  • departureTime     — "now" or Unix timestamp string (enables traffic data)
+ *
+ * Quota tracking:
+ *  • Every Google API call (Directions + Geocoding) is logged via quota-service.
+ *  • Supabase is used as primary storage when configured; falls back to memory.
+ *  • The full QuotaStatusByType is returned in the response for the dashboard.
  */
 
 import { NextRequest, NextResponse } from 'next/server';
 import {
-  getQuotaStatus,
-  incrementQuota,
-  isQuotaExhausted,
-} from '@/lib/maps/quota-store';
+  logApiCall,
+  isAnyQuotaExhausted,
+  getQuotaStatusFromDB,
+} from '@/lib/maps/quota-service';
 import type {
   CalculateRequest,
   RouteResult,
@@ -75,7 +82,7 @@ function toGoogleMode(mode: TravelMode | undefined): string {
  */
 function buildAvoidParam(avoids: AvoidOption[] | undefined): string | null {
   if (!avoids || avoids.length === 0) return null;
-  // 'indoor' is only valid for walking / transit — callers should guard this
+  // Whitelist valid values to prevent injection
   const validValues: AvoidOption[] = ['tolls', 'highways', 'ferries', 'indoor'];
   const filtered = avoids.filter((a) => validValues.includes(a));
   return filtered.length > 0 ? filtered.join('|') : null;
@@ -88,7 +95,10 @@ function buildAvoidParam(avoids: AvoidOption[] | undefined): string | null {
  */
 function buildTransitModeParam(modes: TransitMode[] | undefined): string | null {
   if (!modes || modes.length === 0) return null;
-  return modes.join('|');
+  // Whitelist valid transit modes
+  const validModes: TransitMode[] = ['bus', 'subway', 'train', 'tram', 'rail'];
+  const filtered = modes.filter((m) => validModes.includes(m));
+  return filtered.length > 0 ? filtered.join('|') : null;
 }
 
 /**
@@ -99,7 +109,7 @@ function buildTransitModeParam(modes: TransitMode[] | undefined): string | null 
 function sanitiseDepartureTime(raw: string | undefined): string | null {
   if (!raw) return null;
   if (raw === 'now') return 'now';
-  // Must be a positive integer
+  // Must be a positive integer (Unix timestamp in seconds)
   const n = parseInt(raw, 10);
   if (!isNaN(n) && n > 0 && String(n) === raw) return String(n);
   return null;
@@ -109,10 +119,13 @@ function sanitiseDepartureTime(raw: string | undefined): string | null {
 
 export async function POST(request: NextRequest) {
   // ══════════════════════════════════════════════════════════
-  //   KILL SWITCH — Block all calls when quota is exhausted
+  //   KILL SWITCH — Block all calls when ANY quota is exhausted
   //   to prevent billing charges beyond the free tier.
+  //   This is checked BEFORE parsing the request body to short-
+  //   circuit as fast as possible.
   // ══════════════════════════════════════════════════════════
-  if (isQuotaExhausted()) {
+  if (await isAnyQuotaExhausted()) {
+    const quotaStatusByType = await getQuotaStatusFromDB();
     return NextResponse.json(
       {
         error: 'QUOTA_EXHAUSTED',
@@ -120,13 +133,15 @@ export async function POST(request: NextRequest) {
           'The Google Maps API free quota has been fully consumed. ' +
           'All requests are blocked to prevent additional billing charges. ' +
           'Please reset the quota counter or wait for the next billing cycle.',
-        quotaStatus: getQuotaStatus(),
+        quotaStatus:       quotaStatusByType.combined,
+        quotaStatusByType,
       },
       { status: 429 },
     );
   }
 
   // ── Validate API key ───────────────────────────────────────
+  // The API key is server-side only — never sent to the client
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
@@ -157,6 +172,7 @@ export async function POST(request: NextRequest) {
     departureTime,
   } = body;
 
+  // Validate required fields
   if (!origin?.trim()) {
     return NextResponse.json(
       { error: 'Origin location is required.' },
@@ -172,18 +188,20 @@ export async function POST(request: NextRequest) {
 
   // ── Derive Google API parameters ───────────────────────────
   const googleMode = toGoogleMode(travelMode);
-  // indoor avoid is only meaningful for walking / transit — strip it otherwise
+
+  // 'indoor' avoid is only meaningful for walking / transit — strip it for other modes
   const effectiveAvoidOptions: AvoidOption[] | undefined =
     googleMode !== 'walking' && googleMode !== 'transit'
       ? avoidOptions?.filter((a) => a !== 'indoor')
       : avoidOptions;
   const effectiveAvoidParam = buildAvoidParam(effectiveAvoidOptions);
 
+  // Transit sub-parameters only apply when mode=transit
   const transitModeParam     = googleMode === 'transit' ? buildTransitModeParam(transitModes) : null;
   const transitPrefParam: TransitRoutingPreference | null =
     googleMode === 'transit' ? (transitPreference ?? null) : null;
 
-  // trafficModel & departureTime only relevant for driving/motorcycle
+  // Traffic model and departure time only apply for driving / motorcycle
   const safeDepartureTime =
     (googleMode === 'driving')
       ? sanitiseDepartureTime(departureTime)
@@ -192,6 +210,7 @@ export async function POST(request: NextRequest) {
     safeDepartureTime && googleMode === 'driving' ? (trafficModel ?? 'best_guess') : null;
 
   // ── Geocode the origin for map centering ──────────────────
+  // This counts as one Geocoding API call
   let originCoords: { lat: number; lng: number } | undefined;
   try {
     const p = new URLSearchParams({
@@ -200,13 +219,28 @@ export async function POST(request: NextRequest) {
       language: 'zh-TW',
     });
     const res  = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${p}`);
-    const data = await res.json();
-    // Count geocode call against quota (1 request)
-    incrementQuota(1);
+    const data = await res.json() as { status: string; results?: Array<{ geometry: { location: { lat: number; lng: number } } }> };
+
+    // Log this Geocoding API call to quota tracking
+    await logApiCall({
+      apiType:       'geocoding',
+      originQuery:   origin,
+      status:        data.status === 'OK' ? 'success' : 'error',
+      errorCode:     data.status !== 'OK' ? data.status : undefined,
+    });
+
     if (data.status === 'OK' && data.results?.[0]) {
-      originCoords = data.results[0].geometry.location as { lat: number; lng: number };
+      originCoords = data.results[0].geometry.location;
     }
-  } catch {
+  } catch (err) {
+    // Log the failed geocoding call, then continue (non-fatal)
+    await logApiCall({
+      apiType:   'geocoding',
+      originQuery: origin,
+      status:    'error',
+      errorCode: 'NETWORK_ERROR',
+    });
+    console.error('[calculate] Geocoding failed:', err);
     // Non-fatal — map will centre on the first successful route leg start location
   }
 
@@ -215,17 +249,18 @@ export async function POST(request: NextRequest) {
 
   for (let i = 0; i < destinations.length; i++) {
     // Re-check kill switch before EVERY individual API call to stop mid-batch
-    if (isQuotaExhausted()) {
+    // This prevents runaway usage when quota was exhausted mid-request
+    if (await isAnyQuotaExhausted()) {
       routes.push({
-        locationId:   destinations[i].id,
-        address:      destinations[i].address,
-        index:        i + 1,
-        distance:     'N/A',
+        locationId:    destinations[i].id,
+        address:       destinations[i].address,
+        index:         i + 1,
+        distance:      'N/A',
         distanceValue: 0,
-        duration:     'N/A',
-        status:       'error',
-        errorMessage: 'Quota exhausted — this destination was not calculated.',
-        color:        ROUTE_COLORS[i % ROUTE_COLORS.length],
+        duration:      'N/A',
+        status:        'error',
+        errorMessage:  'Quota exhausted — this destination was not calculated.',
+        color:         ROUTE_COLORS[i % ROUTE_COLORS.length],
         travelMode,
       });
       continue;
@@ -234,6 +269,7 @@ export async function POST(request: NextRequest) {
     const dest = destinations[i];
 
     // Build query parameters for the Directions API call
+    // All values are either whitelisted or sanitised above
     const params = new URLSearchParams({
       origin:      origin,
       destination: dest.address,
@@ -249,7 +285,7 @@ export async function POST(request: NextRequest) {
     if (transitModeParam)  params.set('transit_mode', transitModeParam);
     if (transitPrefParam)  params.set('transit_routing_preference', transitPrefParam);
 
-    // Driving traffic options
+    // Driving traffic options (only when mode=driving and departure_time provided)
     if (safeDepartureTime)     params.set('departure_time', safeDepartureTime);
     if (effectiveTrafficModel) params.set('traffic_model', effectiveTrafficModel);
 
@@ -257,37 +293,68 @@ export async function POST(request: NextRequest) {
       const res  = await fetch(
         `https://maps.googleapis.com/maps/api/directions/json?${params}`,
       );
-      const data = await res.json();
-      // Count this Directions API call against quota
-      incrementQuota(1);
+      const data = await res.json() as {
+        status: string;
+        routes?: Array<{
+          overview_polyline: { points: string };
+          legs: Array<{
+            distance: { value: number; text: string };
+            duration: { value: number; text: string };
+            duration_in_traffic?: { text: string };
+            start_location: { lat: number; lng: number };
+            end_location:   { lat: number; lng: number };
+          }>;
+        }>;
+      };
 
-      if (data.status === 'OK' && data.routes?.length > 0) {
+      if (data.status === 'OK' && data.routes && data.routes.length > 0) {
         const route = data.routes[0];
         const leg   = route.legs[0];
         const distanceKm = (leg.distance.value / 1000).toFixed(1);
 
+        // Log successful Directions API call
+        await logApiCall({
+          apiType:           'directions',
+          travelMode:        travelMode,
+          avoidOptions:      avoidOptions,
+          status:            'success',
+          originQuery:       origin,
+          destinationQuery:  dest.address,
+        });
+
         // Fallback: use leg start_location as origin coords if geocoding failed
         if (!originCoords && leg.start_location) {
-          originCoords = leg.start_location as { lat: number; lng: number };
+          originCoords = leg.start_location;
         }
 
         routes.push({
-          locationId:   dest.id,
-          address:      dest.address,
-          index:        i + 1,
-          distance:     `${distanceKm} km`,
+          locationId:    dest.id,
+          address:       dest.address,
+          index:         i + 1,
+          distance:      `${distanceKm} km`,
           distanceValue: leg.distance.value,
-          duration:     leg.duration.text,
+          duration:      leg.duration.text,
           // duration_in_traffic is present only when departure_time was supplied
           durationInTraffic: leg.duration_in_traffic?.text ?? undefined,
-          status:       'success',
-          encodedPolyline: route.overview_polyline.points as string,
-          color:        ROUTE_COLORS[i % ROUTE_COLORS.length],
-          startLocation: leg.start_location as { lat: number; lng: number },
-          endLocation:   leg.end_location   as { lat: number; lng: number },
+          status:        'success',
+          encodedPolyline: route.overview_polyline.points,
+          color:         ROUTE_COLORS[i % ROUTE_COLORS.length],
+          startLocation: leg.start_location,
+          endLocation:   leg.end_location,
           travelMode,
         });
       } else {
+        // Log failed Directions API call (Google returned an error status)
+        await logApiCall({
+          apiType:          'directions',
+          travelMode:       travelMode,
+          avoidOptions:     avoidOptions,
+          status:           'error',
+          errorCode:        data.status ?? 'UNKNOWN',
+          originQuery:      origin,
+          destinationQuery: dest.address,
+        });
+
         routes.push({
           locationId:    dest.id,
           address:       dest.address,
@@ -302,6 +369,17 @@ export async function POST(request: NextRequest) {
         });
       }
     } catch {
+      // Log network-level failure for this Directions API call
+      await logApiCall({
+        apiType:          'directions',
+        travelMode:       travelMode,
+        avoidOptions:     avoidOptions,
+        status:           'error',
+        errorCode:        'NETWORK_ERROR',
+        originQuery:      origin,
+        destinationQuery: dest.address,
+      });
+
       routes.push({
         locationId:    dest.id,
         address:       dest.address,
@@ -317,9 +395,16 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  // ── Fetch final quota status after all API calls ───────────
+  // This is done ONCE at the end to minimise Supabase queries
+  const quotaStatusByType = await getQuotaStatusFromDB();
+
   return NextResponse.json({
     routes,
-    quotaStatus: getQuotaStatus(),
+    /** Combined quota for backward compat with existing frontend code */
+    quotaStatus:       quotaStatusByType.combined,
+    /** Full per-type breakdown for the updated QuotaDashboard */
+    quotaStatusByType,
     originCoords,
   });
 }
