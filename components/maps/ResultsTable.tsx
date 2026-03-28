@@ -74,15 +74,12 @@ interface Props {
 }
 
 export default function ResultsTable({ routes, origin, travelOptions }: Props) {
-  if (routes.length === 0) return null;
-
-  // Separate routes into success and error groups for badge counts
-  const successful = routes.filter((r) => r.status === 'success');
-  const failed = routes.filter((r) => r.status === 'error');
-
   /* ── CSV export ── */
-  // Wrapped in useCallback to prevent unnecessary re-renders of the button and
-  // to ensure the closure captures the current routes/origin/travelOptions values
+  // useCallback MUST be declared before any conditional return to satisfy React's
+  // Rules of Hooks — hooks must be called unconditionally in the same order on every render.
+  // The function is only invoked on button click, which cannot happen when the
+  // component returns null (no button is rendered), so calling it unconditionally
+  // here has no runtime cost when routes is empty.
   const exportCSV = useCallback(() => {
     // ── Line 1: metadata row ──────────────────────────────────
     // origin is direct user input — must sanitise against formula injection (CWE-1236)
@@ -112,28 +109,40 @@ export default function ResultsTable({ routes, origin, travelOptions }: Props) {
     // All user-controlled or third-party-API-sourced values go through
     // sanitizeCsvCell to prevent formula injection (CWE-1236).
     const dataRows = routes.map((r) => {
-      // Use raw distanceValue (metres) for a reliable numeric format instead
-      // of stripping the ' km' suffix from the display string (which is fragile
-      // and would lose precision). Divide by 1000 and format to 1 decimal place.
-      const distKm    = r.status === 'success' ? (r.distanceValue / 1000).toFixed(1) : 'N/A';
+      // Use explicit if/else to narrow the discriminated union once instead of
+      // repeating r.status === 'success' three times in ternary expressions.
+      // This is a DRY principle (single source of truth for each branch) that also
+      // makes both paths explicit and easier to modify — reduces bug risk when the
+      // status type or handling logic changes.
+      let distKm: string;
+      let duration: string;
+      let status: string;
 
-      // duration comes from Google's API — sanitise defensively in case the API
-      // ever returns unexpected characters
-      const duration  = r.status === 'success' ? r.duration : 'N/A';
+      if (r.status === 'success') {
+        // Use raw distanceValue (metres) for reliable precision — avoids fragile
+        // string-suffix stripping of the display label (e.g. "12.3 km")
+        distKm   = (r.distanceValue / 1000).toFixed(1);
+        // duration is Google API text — sanitised below with the rest of the row
+        duration = r.duration;
+        status   = '成功';
+      } else {
+        distKm   = 'N/A';
+        duration = 'N/A';
+        // errorMessage is validated at the API boundary (safeStatus whitelist)
+        // but still sanitised here as a defence-in-depth measure
+        status   = `失敗: ${r.errorMessage ?? ''}`;
+      }
 
-      // errorMessage originates from Google's API status field — sanitise to prevent
-      // injection even though we've validated the status code at the API boundary
-      const status    = r.status === 'success' ? '成功' : `失敗: ${r.errorMessage ?? ''}`;
-
-      // Assemble row fields in the same order as headerFields
+      // Assemble row fields in the same order as headerFields, then sanitize
+      // every field in a single pass through sanitizeCsvCell
       return [
-        r.index,       // integer literal — safe, but sanitizeCsvCell handles numbers too
-        r.address,     // user-entered destination — sanitised below
-        distKm,        // numeric string — sanitised below
-        duration,      // API text — sanitised below
-        travelModeLabel, // from our own constant — low risk, sanitised for consistency
-        avoidLabel,    // from our own constants — sanitised for consistency
-        status,        // partly from API errorMessage — sanitised below
+        r.index,         // integer — safe, but sanitizeCsvCell handles numbers too
+        r.address,       // user-entered destination
+        distKm,
+        duration,        // Google API text
+        travelModeLabel, // from our own constant
+        avoidLabel,      // from our own constants
+        status,          // includes errorMessage from API
       ].map(sanitizeCsvCell).join(',');
     });
 
@@ -163,6 +172,17 @@ export default function ResultsTable({ routes, origin, travelOptions }: Props) {
     // BLOB_URL_REVOKE_DELAY_MS (100ms) gives the browser time to initiate the download.
     setTimeout(() => URL.revokeObjectURL(url), BLOB_URL_REVOKE_DELAY_MS);
   }, [routes, origin, travelOptions]);
+
+  // Early return placed after all hook declarations — React requires hooks to be
+  // called unconditionally in the same order on every render (Rules of Hooks).
+  // The useCallback above is invoked only via button click, which never occurs when
+  // this component returns null, so the hook call cost is amortized across all renders
+  // and does not penalize the early-return case.
+  if (routes.length === 0) return null;
+
+  // Separate routes into success and error groups for the badge counts in the header
+  const successful = routes.filter((r) => r.status === 'success');
+  const failed     = routes.filter((r) => r.status === 'error');
 
   return (
     <section>
