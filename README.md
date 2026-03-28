@@ -3,6 +3,11 @@
 一個使用 **Next.js 15 + TypeScript + Tailwind CSS** 構建的多路線距離計算系統。
 輸入出發基準點與多個目標地點，即時計算路線距離並在地圖上同步可視化。
 
+## 截圖預覽
+
+<img src="docs/screenshot-1.png" width="800" alt="RouteCalc 主畫面" />
+<img src="docs/screenshot-2.png" width="800" alt="RouteCalc 計算結果" />
+
 ## 功能特色
 
 - 🗺️ **多路線可視化**：在 OpenStreetMap 地圖上同時繪製多條彩色路線
