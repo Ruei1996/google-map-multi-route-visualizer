@@ -344,13 +344,35 @@ export async function POST(request: NextRequest) {
           travelMode,
         });
       } else {
+        // Allowlist of known Google Directions API error status codes (CWE-1258: Untrusted Input).
+        // The Google API returns a 'status' field that should match specific known values.
+        // We validate data.status against this whitelist BEFORE embedding it in the
+        // errorMessage to prevent untrusted third-party API values from flowing directly
+        // into client output (a form of data injection). If Google returns an unexpected
+        // status code (e.g. due to API changes or malformed response), we fall back to
+        // 'UNKNOWN_ERROR' instead of passing the raw, unvalidated string to the client.
+        // This prevents scenarios where Google's response could contain injection payload
+        // or unexpected characters that break downstream systems relying on the error message.
+        const KNOWN_GOOGLE_STATUSES = new Set([
+          'OK', 'NOT_FOUND', 'ZERO_RESULTS', 'MAX_WAYPOINTS_EXCEEDED',
+          'INVALID_REQUEST', 'REQUEST_DENIED', 'OVER_DAILY_LIMIT',
+          'OVER_QUERY_LIMIT', 'UNKNOWN_ERROR',
+        ]);
+
+        // Validate the status code against the whitelist.
+        // If data.status is in the Set, use it directly; otherwise fall back to
+        // 'UNKNOWN_ERROR'. This ensures errorMessage always contains a known, safe value.
+        const safeStatus = KNOWN_GOOGLE_STATUSES.has(data.status)
+          ? data.status
+          : 'UNKNOWN_ERROR';
+
         // Log failed Directions API call (Google returned an error status)
         await logApiCall({
           apiType:          'directions',
           travelMode:       travelMode,
           avoidOptions:     avoidOptions,
           status:           'error',
-          errorCode:        data.status ?? 'UNKNOWN',
+          errorCode:        safeStatus,
           originQuery:      origin,
           destinationQuery: dest.address,
         });
@@ -363,7 +385,8 @@ export async function POST(request: NextRequest) {
           distanceValue: 0,
           duration:      'N/A',
           status:        'error',
-          errorMessage:  `Google Maps: ${data.status ?? 'Unknown error'}`,
+          // Use safeStatus (whitelisted) instead of data.status (untrusted) to prevent injection
+          errorMessage:  `Google Maps: ${safeStatus}`,
           color:         ROUTE_COLORS[i % ROUTE_COLORS.length],
           travelMode,
         });
